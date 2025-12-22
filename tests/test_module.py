@@ -14,6 +14,7 @@ def test_import_works(module_name):
     assert hasattr(__import__(module_name), "__version__")
 
 
+@pytest.mark.skip(reason="Incurs network traffic")
 def test_cli_runs_when_main(module_name, capsys):
     try:
         runpy.run_module(module_name, run_name="__main__")
