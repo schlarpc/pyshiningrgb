@@ -1,5 +1,14 @@
 # pyshiningrgb
 
+## About
+
+This library is a reverse-engineered reimplementation of the Wi-Fi control protocol for the
+this RGB LED mask: [ShiningRGB LED Mask HD with Wi-Fi Programmable Video Play](https://www.shiningrgb.com/products/led-mask-hd-with-wifi-programmable-video-play-led-digital-electronic-light-up-face-masks-for-halloween-rave-masquerade).
+
+It aims to reimplement all functionality of the [ShiningRGB mobile app](https://apps.apple.com/us/app/shiningrgb/id1629056439)
+as a pure [sans-io](https://sans-io.readthedocs.io/) library, as well as provide an example
+CLI implementation of a control client that implements I/O on top of that library.
+
 ## Development
 
 This project uses [python-base-flake](https://github.com/schlarpc/python-base-flake) as its

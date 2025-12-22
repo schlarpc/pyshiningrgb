@@ -178,7 +178,7 @@
               });
           };
 
-          checks.git-hooks = git-hooks.lib.${pkgs.system}.run {
+          checks.git-hooks = git-hooks.lib.${pkgs.stdenv.hostPlatform.system}.run {
             src = ./.;
             hooks = {
               shellcheck.enable = true;
