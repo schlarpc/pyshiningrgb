@@ -1,0 +1,16 @@
+{
+  "template": "https://github.com/schlarpc/python-base-flake",
+  "commit": "c61374bad7747132cc8ce26ffc9ab1f7e1a466cb",
+  "checkout": "template",
+  "context": {
+    "cookiecutter": {
+      "project_name": "pyshiningrgb",
+      "module_name": "pyshiningrgb",
+      "_template": "https://github.com/schlarpc/python-base-flake",
+      "_output_dir": "/home/schlarpc",
+      "_repo_dir": "/home/schlarpc/.cookiecutters/python-base-flake",
+      "_checkout": "template"
+    }
+  },
+  "directory": null
+}

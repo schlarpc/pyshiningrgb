@@ -1,0 +1,14 @@
+/.direnv/
+/.hypothesis
+/.pytest_cache/
+/.pre-commit-config.yaml
+*.pyc
+__pycache__/
+.coverage
+/.claude
+
+# Nix build output
+/result
+
+# Sphinx build output
+/docs/generated/
