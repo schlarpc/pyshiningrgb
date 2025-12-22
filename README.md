@@ -2,7 +2,7 @@
 
 ## About
 
-This library is a reverse-engineered reimplementation of the Wi-Fi control protocol for the
+This library is a reverse-engineered reimplementation of the Wi-Fi control protocol for
 this RGB LED mask: [ShiningRGB LED Mask HD with Wi-Fi Programmable Video Play](https://www.shiningrgb.com/products/led-mask-hd-with-wifi-programmable-video-play-led-digital-electronic-light-up-face-masks-for-halloween-rave-masquerade).
 
 It aims to reimplement all functionality of the [ShiningRGB mobile app](https://apps.apple.com/us/app/shiningrgb/id1629056439)
