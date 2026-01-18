@@ -8,12 +8,13 @@ from __future__ import annotations
 
 import argparse
 import random
-import socket
 import subprocess
 import sys
 import time
+from collections.abc import Iterable
 from typing import TYPE_CHECKING, cast
 
+import trio
 from PIL import Image
 
 from pyshiningrgb.client import ShiningRGBClient
@@ -275,57 +276,6 @@ def load_and_convert_image(
     return bytes(pixel_data)
 
 
-def read_response(sock: socket.socket, timeout: float = 1.0) -> bytes | None:
-    """Read a single RPC response from socket.
-
-    Args:
-        sock: Connected socket
-        timeout: Read timeout in seconds
-
-    Returns:
-        Response bytes or None if timeout
-    """
-    sock.settimeout(timeout)
-    buffer = b""
-
-    try:
-        # Read until we have enough for magic + minimum header
-        while len(buffer) < 7:
-            chunk = sock.recv(1)
-            if not chunk:
-                return None
-            buffer += chunk
-
-            # Check if we have magic bytes at the start
-            if len(buffer) >= 2 and buffer[:2] != b"\x5a\xa5":
-                # Not magic, keep looking
-                buffer = buffer[1:]
-
-        # We have at least 7 bytes starting with magic
-        # S2C format: magic(2) + method(1) + unknown(1) + length(2) + payload(length) + checksum(1)
-        if buffer[0:2] == b"\x5a\xa5":
-            # Extract length field (bytes 4-5 for S2C)
-            payload_len = buffer[4] | (buffer[5] << 8)
-            total_len = 7 + payload_len
-
-            # Read remaining bytes
-            while len(buffer) < total_len:
-                needed = total_len - len(buffer)
-                chunk = sock.recv(needed)
-                if not chunk:
-                    return None
-                buffer += chunk
-
-            return buffer
-
-    except socket.timeout:
-        if len(buffer) > 0:
-            return buffer
-        return None
-
-    return None
-
-
 def parse_rgb565_color(color_str: str) -> bytes:
     """Parse a color string to RGB565 bytes.
 
@@ -365,7 +315,138 @@ def parse_rgb565_color(color_str: str) -> bytes:
     return value.to_bytes(2, byteorder="little")
 
 
-def send_messages(
+class ResponseReader:
+    """Buffered async reader for S2C protocol messages."""
+
+    # S2C magic bytes
+    MAGIC = b"\x5a\xa5"
+
+    def __init__(self, stream: trio.SocketStream) -> None:
+        """Initialize response reader.
+
+        Args:
+            stream: Trio socket stream to read from
+        """
+        self._stream = stream
+        self._buffer = bytearray()
+
+    async def read_one(self, timeout: float = 1.0) -> bytes | None:
+        """Read a single complete response message.
+
+        Args:
+            timeout: Read timeout in seconds
+
+        Returns:
+            Response bytes or None if timeout/connection closed
+        """
+        with trio.move_on_after(timeout):
+            while True:
+                # Find magic bytes in buffer
+                magic_pos = self._buffer.find(self.MAGIC)
+
+                if magic_pos > 0:
+                    # Discard garbage before magic
+                    del self._buffer[:magic_pos]
+                    magic_pos = 0
+
+                if magic_pos == 0 and len(self._buffer) >= 7:
+                    # Have magic + enough header bytes
+                    # S2C format: magic(2) + method(1) + unknown(1) + length(2) + payload(length) + checksum(1)
+                    payload_len = self._buffer[4] | (self._buffer[5] << 8)
+                    total_len = 7 + payload_len
+
+                    if len(self._buffer) >= total_len:
+                        # Complete message in buffer
+                        message = bytes(self._buffer[:total_len])
+                        del self._buffer[:total_len]
+                        return message
+
+                # Need more data
+                chunk = await self._stream.receive_some(4096)
+                if not chunk:
+                    # Connection closed
+                    return None
+                self._buffer.extend(chunk)
+
+        # Timeout
+        return None
+
+
+async def send_pipelined(
+    stream: trio.SocketStream,
+    messages: Iterable[tuple[str, bytes]],
+    reader: ResponseReader,
+    max_outstanding: int = 10,
+    verbose: bool = False,
+) -> list[bytes | None]:
+    """Send messages with bounded pipelining, return responses.
+
+    Uses a semaphore to limit the number of unacknowledged messages
+    in flight, providing backpressure while still allowing pipelining.
+
+    Args:
+        stream: Trio socket stream
+        messages: Iterable of (description, message_bytes) tuples
+        reader: ResponseReader for receiving responses
+        max_outstanding: Maximum number of unacknowledged messages
+        verbose: If True, print response details
+
+    Returns:
+        List of response bytes (or None for timeouts/errors)
+    """
+    messages = list(messages)
+    if not messages:
+        return []
+
+    outstanding = trio.Semaphore(max_outstanding)
+    responses: list[bytes | None] = [None] * len(messages)
+    send_error: Exception | None = None
+    recv_error: Exception | None = None
+
+    async def sender() -> None:
+        nonlocal send_error
+        try:
+            for i, (description, msg) in enumerate(messages):
+                await outstanding.acquire()
+                if verbose:
+                    print(f"  [{i}] {description}: {len(msg)} bytes")
+                await stream.send_all(msg)
+        except Exception as e:
+            send_error = e
+            raise
+
+    async def receiver() -> None:
+        nonlocal recv_error
+        try:
+            for i in range(len(messages)):
+                response = await reader.read_one()
+                responses[i] = response
+                outstanding.release()
+
+                if response and verbose:
+                    try:
+                        direction, parsed = parse_message(response)
+                        print(f"      Response: method=0x{parsed.method:02x}")
+                    except Exception:
+                        pass
+        except Exception as e:
+            recv_error = e
+            raise
+
+    async with trio.open_nursery() as nursery:
+        nursery.start_soon(sender)
+        nursery.start_soon(receiver)
+
+    # Propagate errors
+    if send_error:
+        raise send_error
+    if recv_error:
+        raise recv_error
+
+    return responses
+
+
+async def send_messages_async(
     host: str,
     port: int,
     timeout: float = 1.0,
@@ -379,7 +460,7 @@ def send_messages(
     background_color: bytes = b"\x00\x00",
     animation_speed: int = 0,
 ) -> int:
-    """Send RPC messages to server and print responses.
+    """Send RPC messages to server and print responses using async pipelining.
 
     Args:
         host: Target host
@@ -399,7 +480,6 @@ def send_messages(
         Exit code (0 for success)
     """
     print(f"[*] Connecting to {host}:{port}...")
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 
     # Initialize video reader if video mode
     video_reader: VideoFrameReader | None = None
@@ -415,124 +495,129 @@ def send_messages(
         if column_shift:
             print(f"[*] Column shift: {column_shift}")
 
+    # Initialize video tracking variables before try block so they're available in except
+    video_start_time: float | None = None
+    video_frames_displayed = 0
+
     try:
-        sock.connect((host, port))
-        print("[*] Connected successfully")
-        print("=" * 80)
+        stream = await trio.open_tcp_stream(host, port)
+        async with stream:
+            print("[*] Connected successfully")
+            print("=" * 80)
 
-        # Start video reader if in video mode
-        if video_reader:
-            video_reader.start()
+            # Create response reader for pipelined communication
+            reader = ResponseReader(stream)
 
-        # Initialize client
-        client = ShiningRGBClient()
-
-        # Upload loop
-        upload_count = 0
-        fps_history: list[float] = []  # Keep last 10 measurements for smoothing
-        video_start_time = time.perf_counter() if video_reader else None
-        video_frames_displayed = 0
-
-        while True:
-            loop_start = time.perf_counter()
-            upload_count += 1
-
-            # Generate pixel data
-            pixel_data: bytes | None = None
-            generation_time = 0.0
-
+            # Start video reader if in video mode
             if video_reader:
-                # Video mode: read next frame from ffmpeg
-                raw_frame = video_reader.read_frame_raw()
+                video_reader.start()
+                video_start_time = time.perf_counter()
 
-                if raw_frame is None:
-                    # End of video
-                    print("\n[*] End of video reached")
-                    print(f"[*] Frames displayed: {video_frames_displayed}")
-                    if video_start_time is not None:
-                        elapsed_total = time.perf_counter() - video_start_time
-                        avg_display_fps = (
-                            video_frames_displayed / elapsed_total if elapsed_total > 0 else 0
-                        )
-                        print(f"[*] Average display FPS: {avg_display_fps:.2f}")
-                    return 0
+            # Initialize client
+            client = ShiningRGBClient()
 
-                # Convert the frame
-                start_time = time.perf_counter()
-                pixel_data = convert_rgb_to_rgb565(
-                    raw_frame, video_reader.width, video_reader.height
+            # Upload loop
+            upload_count = 0
+            fps_history: list[float] = []  # Keep last 10 measurements for smoothing
+
+            while True:
+                loop_start = time.perf_counter()
+                upload_count += 1
+
+                # Generate pixel data
+                pixel_data: bytes | None = None
+                generation_time = 0.0
+
+                if video_reader:
+                    # Video mode: read next frame from ffmpeg
+                    raw_frame = video_reader.read_frame_raw()
+
+                    if raw_frame is None:
+                        # End of video
+                        print("\n[*] End of video reached")
+                        print(f"[*] Frames displayed: {video_frames_displayed}")
+                        if video_start_time is not None:
+                            elapsed_total = time.perf_counter() - video_start_time
+                            avg_display_fps = (
+                                video_frames_displayed / elapsed_total if elapsed_total > 0 else 0
+                            )
+                            print(f"[*] Average display FPS: {avg_display_fps:.2f}")
+
+                        if loop:
+                            # Restart video for looping
+                            print("[*] Looping video...")
+                            video_reader.close()
+                            video_reader.start()
+                            continue
+
+                        return 0
+
+                    # Convert the frame
+                    start_time = time.perf_counter()
+                    pixel_data = convert_rgb_to_rgb565(
+                        raw_frame, video_reader.width, video_reader.height
+                    )
+                    generation_time = time.perf_counter() - start_time
+                    video_frames_displayed += 1
+
+                    print(f"\n[Frame #{video_frames_displayed}]")
+
+                elif image_path:
+                    # Image mode
+                    start_time = time.perf_counter()
+                    pixel_data = load_and_convert_image(
+                        image_path, MASK_WIDTH, MASK_HEIGHT, column_shift=column_shift
+                    )
+                    generation_time = time.perf_counter() - start_time
+                    print(f"\n[Upload #{upload_count}]")
+
+                else:
+                    # Random mode
+                    start_time = time.perf_counter()
+                    pixel_data = generate_random_pixel_data(MASK_WIDTH, MASK_HEIGHT)
+                    generation_time = time.perf_counter() - start_time
+                    print(f"\n[Upload #{upload_count}]")
+
+                # Prepare upload sequence
+                upload_sequence = client.prepare_image_upload(
+                    MASK_WIDTH,
+                    MASK_HEIGHT,
+                    pixel_data,
+                    animation_type=animation_type,
+                    background_color=background_color,
+                    animation_speed=animation_speed,
                 )
-                generation_time = time.perf_counter() - start_time
-                video_frames_displayed += 1
 
-                print(f"\n[Frame #{video_frames_displayed}]")
-
-            elif image_path:
-                # Image mode
-                start_time = time.perf_counter()
-                pixel_data = load_and_convert_image(
-                    image_path, MASK_WIDTH, MASK_HEIGHT, column_shift=column_shift
+                # Send all messages with pipelining
+                await send_pipelined(
+                    stream, upload_sequence, reader, max_outstanding=10, verbose=verbose
                 )
-                generation_time = time.perf_counter() - start_time
-                print(f"\n[Upload #{upload_count}]")
 
-            else:
-                # Random mode
-                start_time = time.perf_counter()
-                pixel_data = generate_random_pixel_data(MASK_WIDTH, MASK_HEIGHT)
-                generation_time = time.perf_counter() - start_time
-                print(f"\n[Upload #{upload_count}]")
+                loop_elapsed = time.perf_counter() - loop_start
 
-            # Prepare upload sequence
-            upload_sequence = client.prepare_image_upload(
-                MASK_WIDTH,
-                MASK_HEIGHT,
-                pixel_data,
-                animation_type=animation_type,
-                background_color=background_color,
-                animation_speed=animation_speed,
-            )
+                print(f"  Sent {len(upload_sequence)} messages")
+                if generation_time > 0:
+                    print(f"  Frame processing: {generation_time * 1000:.2f} ms")
+                print(f"  Total loop time: {loop_elapsed * 1000:.2f} ms")
 
-            # Send all messages
-            for i, (description, msg) in enumerate(upload_sequence):
-                if verbose:
-                    print(f"  [{i}] {description}: {len(msg)} bytes")
-                sock.send(msg)
+                # Calculate FPS
+                fps = 1.0 / loop_elapsed if loop_elapsed > 0 else 0
+                fps_history.append(fps)
+                if len(fps_history) > 10:
+                    fps_history.pop(0)
+                avg_fps = sum(fps_history) / len(fps_history)
 
-                # Read response
-                response = read_response(sock, timeout=timeout)
-                if response and verbose:
-                    try:
-                        direction, parsed = parse_message(response)
-                        print(f"      Response: method=0x{parsed.method:02x}")
-                    except Exception:
-                        pass
+                print(f"  Display FPS: {fps:.2f}")
+                if len(fps_history) > 1:
+                    print(f"  Average FPS (last {len(fps_history)}): {avg_fps:.2f}")
 
-            loop_elapsed = time.perf_counter() - loop_start
+                if not loop and not video_reader:
+                    break
 
-            print(f"  Sent {len(upload_sequence)} messages")
-            if generation_time > 0:
-                print(f"  Frame processing: {generation_time * 1000:.2f} ms")
-            print(f"  Total loop time: {loop_elapsed * 1000:.2f} ms")
+                if loop_delay > 0 and not video_reader:
+                    await trio.sleep(loop_delay)
 
-            # Calculate FPS
-            fps = 1.0 / loop_elapsed if loop_elapsed > 0 else 0
-            fps_history.append(fps)
-            if len(fps_history) > 10:
-                fps_history.pop(0)
-            avg_fps = sum(fps_history) / len(fps_history)
-
-            print(f"  Display FPS: {fps:.2f}")
-            if len(fps_history) > 1:
-                print(f"  Average FPS (last {len(fps_history)}): {avg_fps:.2f}")
-
-            if not loop and not video_reader:
-                break
-
-            if loop_delay > 0 and not video_reader:
-                time.sleep(loop_delay)
-
-        return 0
+            return 0
 
     except KeyboardInterrupt:
         print("\n[*] Interrupted by user")
@@ -556,7 +641,6 @@ def send_messages(
     finally:
         if video_reader:
             video_reader.close()
-        sock.close()
         print("\n[*] Connection closed")
 
 
@@ -582,7 +666,7 @@ def main() -> None:
     parser.add_argument(
         "--loop",
         action="store_true",
-        help="Continuously send images (ignored in video mode)",
+        help="Continuously send images/video (restarts video when it ends)",
     )
     parser.add_argument(
         "--loop-delay",
@@ -638,21 +722,25 @@ def main() -> None:
         sys.exit(1)
 
     try:
-        exit_code = send_messages(
+        exit_code = trio.run(
+            send_messages_async,
             args.host,
             args.port,
-            timeout=args.timeout,
-            loop=args.loop,
-            loop_delay=args.loop_delay,
-            verbose=args.verbose,
-            image_path=args.image,
-            column_shift=args.column_shift,
-            video_path=args.video,
-            animation_type=AnimationType[args.animation_type],
-            background_color=background_color,
-            animation_speed=args.animation_speed,
+            args.timeout,
+            args.loop,
+            args.loop_delay,
+            args.verbose,
+            args.image,
+            args.column_shift,
+            args.video,
+            AnimationType[args.animation_type],
+            background_color,
+            args.animation_speed,
         )
         sys.exit(exit_code)
+    except KeyboardInterrupt:
+        print("\n[*] Interrupted by user")
+        sys.exit(0)
     except Exception as e:
         print(f"\n[!] FATAL ERROR: {e}", file=sys.stderr)
         import traceback
