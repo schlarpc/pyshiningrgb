@@ -41,6 +41,24 @@ class Method03Submethod(IntEnum):
     TRANSFER_COMPLETE = 0x03
 
 
+class Method0aSubmethod(IntEnum):
+    """Submethods for method 0x0a."""
+
+    APPLY_ATTRIBUTES = 0x04
+    SET_ATTRIBUTES = 0x06
+
+
+class AnimationType(IntEnum):
+    """Animation type enum for method 0x0a set attributes."""
+
+    NONE = 0x01
+    SCROLL_TO_LEFT = 0x02
+    SCROLL_TO_RIGHT = 0x03
+    SCROLL_TO_TOP = 0x04
+    SCROLL_TO_BOTTOM = 0x05
+    BLINK = 0x06
+
+
 # Method 0x08: Mode selection
 ModeSelectPayload: Construct = Struct(
     "mode" / Enum(Int8ul, RenderMode),
@@ -133,9 +151,39 @@ Method09Payload: Construct = Struct(
 )
 
 
-# Method 0x0a: Unknown (seen with two different payload lengths)
-Method0aPayload: Construct = Struct(
-    "payload_data" / GreedyBytes,
+# Method 0x0a: Display attributes
+# This method uses subcommands:
+#   0x04: Apply attributes (end of message marker)
+#   0x06: Set attributes (includes animation type)
+
+# Submethod 0x04: Apply attributes (EOM)
+ApplyAttributesPayload: Construct = Struct(
+    "submethod" / Const(0x04, Int8ul),
+)
+
+
+# Submethod 0x06: Set attributes
+# Payload format (observed):
+#   06 00 00 00 01 CC CC XX SS
+#   where XX is the animation type (see AnimationType enum)
+#         CC CC is the background color (RGB565 format, little-endian)
+#         SS is the animation speed (0x00 = slowest, 0x0a = fastest)
+SetAttributesPayload: Construct = Struct(
+    "submethod" / Const(0x06, Int8ul),
+    "unknown1" / Bytes(3),  # 00 00 00
+    "unknown2" / Int8ul,  # 0x01
+    "background_color" / Bytes(2),  # RGB565 format
+    "animation_type" / Enum(Int8ul, AnimationType),
+    "animation_speed" / Int8ul,  # 0x00 (slowest) - 0x0a (fastest)
+)
+
+
+# Top-level Method 0x0a payload dispatcher
+Method0aPayload: Construct = Select(
+    SetAttributesPayload,
+    ApplyAttributesPayload,
+    # Fallback for unknown submethods
+    Struct("payload_data" / GreedyBytes),
 )
 
 
@@ -186,6 +234,6 @@ def get_submethod(method: int, payload_bytes: bytes) -> int | None:
     Returns:
         Submethod byte or None if method doesn't use submethods
     """
-    if method == 0x03 and len(payload_bytes) > 0:
+    if method in (0x03, 0x0A) and len(payload_bytes) > 0:
         return payload_bytes[0]
     return None

@@ -18,6 +18,7 @@ from PIL import Image
 
 from pyshiningrgb.client import ShiningRGBClient
 from pyshiningrgb.protocol import parse_message
+from pyshiningrgb.semantic import AnimationType
 
 if TYPE_CHECKING:
     from PIL.Image import Image as PILImage
@@ -325,6 +326,45 @@ def read_response(sock: socket.socket, timeout: float = 1.0) -> bytes | None:
     return None
 
 
+def parse_rgb565_color(color_str: str) -> bytes:
+    """Parse a color string to RGB565 bytes.
+
+    Accepts formats:
+        - Hex: "0x1234" or "1234" (raw RGB565 value)
+        - RGB: "r,g,b" where each is 0-255
+
+    Args:
+        color_str: Color string to parse
+
+    Returns:
+        2 bytes in RGB565 format, little-endian
+
+    Raises:
+        ValueError: If format is invalid
+    """
+    color_str = color_str.strip()
+
+    # Try RGB format first (r,g,b)
+    if "," in color_str:
+        parts = color_str.split(",")
+        if len(parts) != 3:
+            raise ValueError(f"RGB format requires 3 components, got {len(parts)}")
+        r, g, b = (int(p.strip()) for p in parts)
+        if not (0 <= r <= 255 and 0 <= g <= 255 and 0 <= b <= 255):
+            raise ValueError("RGB values must be 0-255")
+        # Convert to RGB565
+        pixel = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3)
+        return pixel.to_bytes(2, byteorder="little")
+
+    # Try hex format
+    if color_str.startswith("0x") or color_str.startswith("0X"):
+        color_str = color_str[2:]
+    value = int(color_str, 16)
+    if not 0 <= value <= 0xFFFF:
+        raise ValueError("Hex color must be 0x0000-0xFFFF")
+    return value.to_bytes(2, byteorder="little")
+
+
 def send_messages(
     host: str,
     port: int,
@@ -335,6 +375,9 @@ def send_messages(
     image_path: str | None = None,
     column_shift: int = 0,
     video_path: str | None = None,
+    animation_type: AnimationType = AnimationType.NONE,
+    background_color: bytes = b"\x00\x00",
+    animation_speed: int = 0,
 ) -> int:
     """Send RPC messages to server and print responses.
 
@@ -348,6 +391,9 @@ def send_messages(
         image_path: Optional path to image file
         column_shift: Number of columns to shift left (wrap around)
         video_path: Optional path to video file
+        animation_type: Animation type for display
+        background_color: Background color in RGB565 format (2 bytes)
+        animation_speed: Animation speed from 0 (slowest) to 10 (fastest)
 
     Returns:
         Exit code (0 for success)
@@ -438,7 +484,14 @@ def send_messages(
                 print(f"\n[Upload #{upload_count}]")
 
             # Prepare upload sequence
-            upload_sequence = client.prepare_image_upload(MASK_WIDTH, MASK_HEIGHT, pixel_data)
+            upload_sequence = client.prepare_image_upload(
+                MASK_WIDTH,
+                MASK_HEIGHT,
+                pixel_data,
+                animation_type=animation_type,
+                background_color=background_color,
+                animation_speed=animation_speed,
+            )
 
             # Send all messages
             for i, (description, msg) in enumerate(upload_sequence):
@@ -550,11 +603,38 @@ def main() -> None:
         help="Shift columns left by N pixels (wraps around, default: 0)",
     )
     parser.add_argument("--verbose", "-v", action="store_true", help="Show detailed message info")
+    parser.add_argument(
+        "--animation-type",
+        type=str,
+        choices=[e.name for e in AnimationType],
+        default=AnimationType.NONE.name,
+        help="Animation type (default: NONE)",
+    )
+    parser.add_argument(
+        "--animation-speed",
+        type=int,
+        default=0,
+        choices=range(0, 11),
+        metavar="0-10",
+        help="Animation speed: 0 (slowest, default) to 10 (fastest)",
+    )
+    parser.add_argument(
+        "--background-color",
+        type=str,
+        default="0x0000",
+        help="Background color as RGB565 hex (e.g., 0xf800 for red) or RGB (e.g., 255,0,0)",
+    )
     args = parser.parse_args()
 
     # Validate mutually exclusive options
     if args.video and args.image:
         print("[!] Error: --video and --image cannot be used together", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        background_color = parse_rgb565_color(args.background_color)
+    except ValueError as e:
+        print(f"[!] Error: Invalid background color: {e}", file=sys.stderr)
         sys.exit(1)
 
     try:
@@ -568,6 +648,9 @@ def main() -> None:
             image_path=args.image,
             column_shift=args.column_shift,
             video_path=args.video,
+            animation_type=AnimationType[args.animation_type],
+            background_color=background_color,
+            animation_speed=args.animation_speed,
         )
         sys.exit(exit_code)
     except Exception as e:

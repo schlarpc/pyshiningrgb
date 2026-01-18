@@ -9,12 +9,15 @@ from __future__ import annotations
 
 from pyshiningrgb.protocol import MAX_C2S_PAYLOAD, build_c2s_message
 from pyshiningrgb.semantic import (
+    AnimationType,
+    ApplyAttributesPayload,
     DataTransferPayload,
     LibraryLoadPayload,
     Method06Payload,
     Method09Payload,
     ModeSelectPayload,
     RenderMode,
+    SetAttributesPayload,
     TransferCompletePayload,
 )
 
@@ -190,7 +193,7 @@ def build_method_09(unknown1: int = 0x02, unknown2: int = 0x00) -> bytes:
 
 
 def build_method_0a(payload_data: bytes) -> bytes:
-    """Build method 0x0a message (purpose unknown).
+    """Build method 0x0a message with raw payload.
 
     Args:
         payload_data: Raw payload bytes
@@ -199,6 +202,56 @@ def build_method_0a(payload_data: bytes) -> bytes:
         Complete C2S message bytes ready to send
     """
     return build_c2s_message(0x0A, payload_data)
+
+
+def build_set_attributes(
+    animation_type: AnimationType = AnimationType.NONE,
+    background_color: bytes = b"\x00\x00",
+    animation_speed: int = 0,
+    unknown1: bytes = b"\x00\x00\x00",
+    unknown2: int = 0x01,
+) -> bytes:
+    """Build set attributes message (method 0x0a, submethod 0x06).
+
+    Args:
+        animation_type: Animation type (see AnimationType enum)
+        background_color: Background color in RGB565 format (2 bytes, little-endian)
+        animation_speed: Animation speed from 0 (slowest) to 10 (fastest)
+        unknown1: Unknown 3 bytes (default 0x00 0x00 0x00)
+        unknown2: Unknown byte (default 0x01)
+
+    Returns:
+        Complete C2S message bytes ready to send
+
+    Raises:
+        ValueError: If animation_speed is out of range (0-10)
+    """
+    if not 0 <= animation_speed <= 10:
+        raise ValueError(f"animation_speed must be 0-10, got {animation_speed}")
+
+    payload = SetAttributesPayload.build(
+        {
+            "unknown1": unknown1,
+            "unknown2": unknown2,
+            "background_color": background_color,
+            "animation_type": animation_type,
+            "animation_speed": animation_speed,
+        }
+    )
+    return build_c2s_message(0x0A, payload)
+
+
+def build_apply_attributes() -> bytes:
+    """Build apply attributes message (method 0x0a, submethod 0x04).
+
+    This acts as an end-of-message marker after setting attributes and
+    transferring image data.
+
+    Returns:
+        Complete C2S message bytes ready to send
+    """
+    payload = ApplyAttributesPayload.build({})
+    return build_c2s_message(0x0A, payload)
 
 
 def build_data_transfer_auto(

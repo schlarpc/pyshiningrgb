@@ -8,13 +8,14 @@ strictly sans-io - all I/O operations must be performed by the caller.
 from __future__ import annotations
 
 from pyshiningrgb.builders import (
+    build_apply_attributes,
     build_data_transfer_auto,
     build_library_load,
-    build_method_0a,
     build_mode_select,
+    build_set_attributes,
     build_transfer_complete,
 )
-from pyshiningrgb.semantic import RenderMode
+from pyshiningrgb.semantic import AnimationType, RenderMode
 
 
 class ImageUploadSequence:
@@ -30,6 +31,9 @@ class ImageUploadSequence:
         height: int,
         pixel_data: bytes,
         unknown_header: bytes = b"\x00\x00\x00\x00",
+        animation_type: AnimationType = AnimationType.NONE,
+        background_color: bytes = b"\x00\x00",
+        animation_speed: int = 0,
     ) -> None:
         """Initialize an image upload sequence.
 
@@ -38,14 +42,20 @@ class ImageUploadSequence:
             height: Image height in pixels (max 0x50 = 80)
             pixel_data: RGB565 pixel data (2 bytes per pixel, little-endian)
             unknown_header: Unknown 4 bytes in data transfer header (default: 0x00 0x00 0x00 0x00)
+            animation_type: Animation type for display (default: NONE)
+            background_color: Background color in RGB565 format (2 bytes, little-endian)
+            animation_speed: Animation speed from 0 (slowest) to 10 (fastest)
 
         Raises:
-            ValueError: If dimensions exceed limits
+            ValueError: If dimensions exceed limits or animation_speed out of range
         """
         self.width = width
         self.height = height
         self.pixel_data = pixel_data
         self.unknown_header = unknown_header
+        self.animation_type = animation_type
+        self.background_color = background_color
+        self.animation_speed = animation_speed
         self._messages: list[tuple[str, bytes]] = []
         self._build_messages()
 
@@ -68,10 +78,20 @@ class ImageUploadSequence:
         # Signal transfer complete
         self._messages.append(("Transfer complete", build_transfer_complete()))
 
-        # Method 0x0a - required to switch the display
+        # Set display attributes (animation type, speed, background color)
         self._messages.append(
-            ("Method 0x0a (display switch)", build_method_0a(bytes.fromhex("04")))
+            (
+                f"Set attributes (animation={self.animation_type.name}, speed={self.animation_speed})",
+                build_set_attributes(
+                    self.animation_type,
+                    background_color=self.background_color,
+                    animation_speed=self.animation_speed,
+                ),
+            )
         )
+
+        # Apply attributes (end of message marker)
+        self._messages.append(("Apply attributes (EOM)", build_apply_attributes()))
 
     def messages(self) -> list[tuple[str, bytes]]:
         """Get the sequence of messages to send.
@@ -111,6 +131,9 @@ class ShiningRGBClient:
         height: int,
         pixel_data: bytes,
         unknown_header: bytes = b"\x00\x00\x00\x00",
+        animation_type: AnimationType = AnimationType.NONE,
+        background_color: bytes = b"\x00\x00",
+        animation_speed: int = 0,
     ) -> ImageUploadSequence:
         """Prepare all messages needed to upload an image.
 
@@ -119,6 +142,9 @@ class ShiningRGBClient:
             height: Image height in pixels (max 0x50 = 80)
             pixel_data: RGB565 pixel data (2 bytes per pixel, little-endian)
             unknown_header: Unknown 4 bytes in data transfer header
+            animation_type: Animation type for display (default: NONE)
+            background_color: Background color in RGB565 format (2 bytes, little-endian)
+            animation_speed: Animation speed from 0 (slowest) to 10 (fastest)
 
         Returns:
             ImageUploadSequence containing all messages to send
@@ -133,7 +159,15 @@ class ShiningRGBClient:
                 f"for {width}x{height} image, got {len(pixel_data)}"
             )
 
-        return ImageUploadSequence(width, height, pixel_data, unknown_header)
+        return ImageUploadSequence(
+            width,
+            height,
+            pixel_data,
+            unknown_header,
+            animation_type,
+            background_color,
+            animation_speed,
+        )
 
     def prepare_mode_switch(self, mode: RenderMode) -> list[tuple[str, bytes]]:
         """Prepare messages to switch rendering mode.
